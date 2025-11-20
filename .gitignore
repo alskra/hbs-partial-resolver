@@ -27,5 +27,6 @@ replay_pid*
 .idea/
 .gradle/
 .kotlin/
-build/
-!/build/distributions/
+build/*
+!build/distributions/
+!build/distributions/**
