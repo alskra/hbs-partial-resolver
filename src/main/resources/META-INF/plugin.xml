@@ -1,0 +1,20 @@
+<idea-plugin>
+    <id>com.example.hbs.partial-resolver</id>
+    <name>HBS Partial Resolver</name>
+    <version>0.1.0</version>
+    <vendor>you</vendor>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.lang</depends>
+    <depends>com.dmarcotte.handlebars</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <psi.referenceContributor language="Handlebars" implementation="com.example.hbs.PsiPartialReferenceContributor"/>
+		<completion.contributor language="Handlebars" implementationClass="com.example.hbs.PartialPathCompletionContributor"/>
+		<postStartupActivity implementation="com.example.hbs.HbsStartupActivity"/>
+	</extensions>
+
+    <description>
+        Completion for Handlebars partials inside .hbs files.
+    </description>
+</idea-plugin>
