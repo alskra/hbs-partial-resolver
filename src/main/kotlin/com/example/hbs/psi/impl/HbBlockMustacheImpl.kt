@@ -5,13 +5,16 @@ import com.example.hbs.psi.HbBlockMustache
 import com.example.hbs.psi.HbMustacheName
 import com.intellij.lang.ASTNode
 import com.intellij.psi.util.PsiTreeUtil
-import com.intellij.extapi.psi.ASTWrapperPsiElement
 
+/**
+ * Базовый класс для всех блоковых мусташей.
+ */
 abstract class HbBlockMustacheImpl(node: ASTNode) : HbMustacheImpl(node), HbBlockMustache {
 
     override fun getBlockMustacheName(): HbMustacheName? =
         PsiTreeUtil.getChildOfType(this, HbMustacheName::class.java)
 
-    override val name: String?
-        get() = getBlockMustacheName()?.name
+    // Убираем nullable, чтобы соответствовать сигнатуре базового класса
+    override val name: String
+        get() = getBlockMustacheName()?.name ?: ""
 }
