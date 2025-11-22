@@ -12,6 +12,8 @@ abstract class HbBlockMustacheImpl(node: ASTNode) : HbMustacheImpl(node), HbBloc
     override fun getBlockMustacheName(): HbMustacheName? =
         PsiTreeUtil.getChildOfType(this, HbMustacheName::class.java)
 
-    override val name: String?
-        get() = getBlockMustacheName()?.name
+    // `HbMustacheImpl` defines `val name: String` (non-null).
+    // Возвращаем имя из блока, если оно есть, иначе используем super.name в качестве фоллбэка.
+    override val name: String
+        get() = getBlockMustacheName()?.name ?: super.name
 }

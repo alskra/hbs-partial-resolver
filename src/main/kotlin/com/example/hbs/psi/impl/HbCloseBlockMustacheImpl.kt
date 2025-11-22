@@ -8,8 +8,9 @@ import com.intellij.psi.PsiElement
 class HbCloseBlockMustacheImpl(astNode: ASTNode) :
     HbBlockMustacheImpl(astNode), HbCloseBlockMustache {
 
-    override fun getPairedElement(): HbOpenBlockMustache? {
-        val openBlockElement: PsiElement? = parent.firstChild
+    override fun getPairedElement(): HbOpenBlockMustache {
+        val openBlockElement: PsiElement? = parent?.firstChild
         return openBlockElement as? HbOpenBlockMustache
+            ?: throw IllegalStateException("Paired HbOpenBlockMustache not found for close-block at: ${this.text}")
     }
 }
