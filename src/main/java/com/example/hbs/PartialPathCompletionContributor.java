@@ -25,12 +25,14 @@ import java.util.stream.Collectors;
 
 /**
  * Completion contributor that physically removes surrounding quotes before completion
- * (so user sees path without quotes), and restores quotes on insert around the entire path.
+ * (so user sees path without quotes), and restores quotes on insert.
  */
 public class PartialPathCompletionContributor extends CompletionContributor {
 
+    // Pattern splits segments: quoted or unquoted segment between slashes
     private static final Pattern SEGMENT_PATTERN = Pattern.compile("\"([^\"]*)\"|'([^']*)'|([^/]+)");
 
+    // Key to store info that quotes were removed in beforeCompletion
     private static final Key<QuoteRemovalInfo> REMOVED_QUOTES_KEY = Key.create("hbs.removedQuotes");
 
     public PartialPathCompletionContributor() {
@@ -79,11 +81,10 @@ public class PartialPathCompletionContributor extends CompletionContributor {
 
                 VirtualFile parentDir = resolveParentDir(project, traverse);
 
-                List<VirtualFile> roots = new ArrayList<>();
-                roots.addAll(Arrays.asList(ProjectRootManager.getInstance(project).getContentSourceRoots()));
-                roots.add(project.getBaseDir());
+                // build candidate list only if parent exists
+                if (parentDir == null || !parentDir.exists()) return;
 
-                List<VirtualFile> candidates = getCandidates(parentDir, roots);
+                List<VirtualFile> candidates = getCandidates(parentDir, Collections.emptyList());
 
                 Set<String> seen = new HashSet<>();
                 for (VirtualFile child : candidates) {
@@ -148,6 +149,7 @@ public class PartialPathCompletionContributor extends CompletionContributor {
 
             doc.deleteString(closeQuoteOffset, closeQuoteOffset + 1);
             doc.deleteString(openQuoteOffset, openQuoteOffset + 1);
+
             PsiDocumentManager.getInstance(project).commitDocument(doc);
 
             editor.putUserData(REMOVED_QUOTES_KEY, new QuoteRemovalInfo(quoteChar));
@@ -162,15 +164,12 @@ public class PartialPathCompletionContributor extends CompletionContributor {
     }
 
     private List<VirtualFile> getCandidates(VirtualFile parentDir, List<VirtualFile> roots) {
-        if (parentDir != null) {
+        if (parentDir != null && parentDir.exists()) {
             return Arrays.stream(parentDir.getChildren())
                     .filter(f -> f.isDirectory() || f.getName().endsWith(".hbs"))
                     .collect(Collectors.toList());
         } else {
-            return roots.stream()
-                    .flatMap(root -> Arrays.stream(root.getChildren())
-                            .filter(f -> f.isDirectory() || f.getName().endsWith(".hbs")))
-                    .collect(Collectors.toList());
+            return Collections.emptyList();
         }
     }
 
@@ -181,7 +180,6 @@ public class PartialPathCompletionContributor extends CompletionContributor {
 
         int idx = start + 3;
         while (idx < fileText.length() && Character.isWhitespace(fileText.charAt(idx))) idx++;
-
         if (idx >= fileText.length()) return null;
 
         boolean hadQuotes = false;
@@ -194,18 +192,21 @@ public class PartialPathCompletionContributor extends CompletionContributor {
 
         int end = offset;
         if (end > fileText.length()) end = fileText.length();
+
         while (end > idx && Character.isWhitespace(fileText.charAt(end - 1))) end--;
 
         if (hadQuotes) {
             int close = fileText.indexOf(quoteChar, idx);
             if (close != -1 && close >= idx) {
                 int extractEnd = Math.min(end, close);
-                return new TextRangeWithQuotes(idx, extractEnd, fileText.substring(idx, extractEnd), true);
+                String text = fileText.substring(idx, extractEnd);
+                return new TextRangeWithQuotes(idx, extractEnd, text, true);
             }
         }
 
         if (idx > end) return new TextRangeWithQuotes(idx, idx, "", hadQuotes);
-        return new TextRangeWithQuotes(idx, end, fileText.substring(idx, end), hadQuotes);
+        String text = fileText.substring(idx, end);
+        return new TextRangeWithQuotes(idx, end, text, hadQuotes);
     }
 
     private static class TextRangeWithQuotes {
@@ -241,32 +242,31 @@ public class PartialPathCompletionContributor extends CompletionContributor {
             if (info == null) return;
 
             final Document doc = ctx.getDocument();
+            final int insertStart = ctx.getStartOffset();
+            final int insertEnd = ctx.getTailOffset();
 
             WriteCommandAction.runWriteCommandAction(project, () -> {
-                int caret = editor.getCaretModel().getOffset();
-                String text = doc.getText();
+                // определяем полный путь внутри {{> }}
+                int pathStart = doc.getText().lastIndexOf("{{>", Math.max(0, insertStart - 1)) + 3;
+                while (pathStart < doc.getTextLength() && Character.isWhitespace(doc.getCharsSequence().charAt(pathStart))) pathStart++;
 
-                int start = text.lastIndexOf("{{>", Math.max(0, caret - 1));
-                if (start == -1) return;
-                start += 3;
-                while (start < text.length() && Character.isWhitespace(text.charAt(start))) start++;
-
-                int end = text.indexOf("}}", start);
-                if (end == -1) end = text.length();
-
-                while (end > start && Character.isWhitespace(text.charAt(end - 1))) end--;
+                int pathEnd = doc.getText().indexOf("}}", pathStart);
+                if (pathEnd == -1) pathEnd = doc.getTextLength();
+                while (pathEnd > pathStart && Character.isWhitespace(doc.getCharsSequence().charAt(pathEnd - 1))) pathEnd--;
 
                 CharSequence cs = doc.getCharsSequence();
-                if (start >= doc.getTextLength() || cs.charAt(start) != info.quoteChar) {
-                    doc.insertString(start, String.valueOf(info.quoteChar));
-                    end += 1;
+                if (pathStart >= doc.getTextLength() || cs.charAt(pathStart) != info.quoteChar) {
+                    doc.insertString(pathStart, String.valueOf(info.quoteChar));
+                    pathEnd += 1;
                 }
-                if (end >= doc.getTextLength() || cs.charAt(end) != info.quoteChar) {
-                    doc.insertString(end, String.valueOf(info.quoteChar));
+                if (pathEnd >= doc.getTextLength() || cs.charAt(pathEnd) != info.quoteChar) {
+                    doc.insertString(pathEnd, String.valueOf(info.quoteChar));
                 }
 
-                editor.getCaretModel().moveToOffset(end + 1);
+                // курсор сразу после вставленного сегмента
+                editor.getCaretModel().moveToOffset(insertEnd + 1);
                 PsiDocumentManager.getInstance(project).commitDocument(doc);
+
                 editor.putUserData(REMOVED_QUOTES_KEY, null);
             });
         }
