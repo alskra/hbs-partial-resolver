@@ -23,16 +23,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-/**
- * Completion contributor that physically removes surrounding quotes before completion
- * (so user sees path without quotes), and restores quotes on insert.
- */
 public class PartialPathCompletionContributor extends CompletionContributor {
 
-    // Pattern splits segments: quoted or unquoted segment between slashes
     private static final Pattern SEGMENT_PATTERN = Pattern.compile("\"([^\"]*)\"|'([^']*)'|([^/]+)");
-
-    // Key to store info that quotes were removed in beforeCompletion
     private static final Key<QuoteRemovalInfo> REMOVED_QUOTES_KEY = Key.create("hbs.removedQuotes");
 
     public PartialPathCompletionContributor() {
@@ -54,7 +47,6 @@ public class PartialPathCompletionContributor extends CompletionContributor {
                 if (range == null) return;
 
                 String rawPath = range.text;
-
                 List<String> segments = new ArrayList<>();
                 Matcher m = SEGMENT_PATTERN.matcher(rawPath);
                 while (m.find()) {
@@ -80,11 +72,10 @@ public class PartialPathCompletionContributor extends CompletionContributor {
                 }
 
                 VirtualFile parentDir = resolveParentDir(project, traverse);
-
-                // build candidate list only if parent exists
                 if (parentDir == null || !parentDir.exists()) return;
 
-                List<VirtualFile> candidates = getCandidates(parentDir, Collections.emptyList());
+                boolean firstSegment = traverse.isEmpty();
+                List<VirtualFile> candidates = getCandidates(parentDir, firstSegment, project);
 
                 Set<String> seen = new HashSet<>();
                 for (VirtualFile child : candidates) {
@@ -123,20 +114,14 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         if (ch != '"' && ch != '\'') return;
 
         final char quoteChar = ch;
-
         int search = idx + 1;
         int closeQuotePos = -1;
         while (search < text.length()) {
             char c = text.charAt(search);
-            if (c == quoteChar) {
-                closeQuotePos = search;
-                break;
-            } else if (c == '}' || Character.isWhitespace(c)) {
-                break;
-            }
+            if (c == quoteChar) { closeQuotePos = search; break; }
+            else if (c == '}' || Character.isWhitespace(c)) break;
             search++;
         }
-
         if (closeQuotePos == -1) return;
 
         final int openQuoteOffset = idx;
@@ -151,26 +136,38 @@ public class PartialPathCompletionContributor extends CompletionContributor {
             doc.deleteString(openQuoteOffset, openQuoteOffset + 1);
 
             PsiDocumentManager.getInstance(project).commitDocument(doc);
-
             editor.putUserData(REMOVED_QUOTES_KEY, new QuoteRemovalInfo(quoteChar));
         });
     }
 
     @Nullable
     private VirtualFile resolveParentDir(Project project, List<String> traverse) {
-        if (traverse.isEmpty()) return null;
         PathResolver resolver = new PathResolver(project);
+        if (traverse.isEmpty()) {
+            // первый сегмент — берем корни проекта
+            return project.getBaseDir();
+        }
         return resolver.resolveSegmentToVirtualFile(traverse, traverse.size() - 1, false);
     }
 
-    private List<VirtualFile> getCandidates(VirtualFile parentDir, List<VirtualFile> roots) {
-        if (parentDir != null && parentDir.exists()) {
-            return Arrays.stream(parentDir.getChildren())
-                    .filter(f -> f.isDirectory() || f.getName().endsWith(".hbs"))
-                    .collect(Collectors.toList());
+    private List<VirtualFile> getCandidates(VirtualFile parentDir, boolean firstSegment, Project project) {
+        if (parentDir == null || !parentDir.exists()) return Collections.emptyList();
+
+        List<VirtualFile> roots = new ArrayList<>();
+        if (firstSegment) {
+            roots.addAll(Arrays.asList(ProjectRootManager.getInstance(project).getContentSourceRoots()));
+            roots.add(parentDir); // Project Root
         } else {
-            return Collections.emptyList();
+            roots.add(parentDir);
         }
+
+        List<VirtualFile> result = new ArrayList<>();
+        for (VirtualFile root : roots) {
+            result.addAll(Arrays.stream(root.getChildren())
+                    .filter(f -> f.isDirectory() || f.getName().endsWith(".hbs"))
+                    .collect(Collectors.toList()));
+        }
+        return result;
     }
 
     @Nullable
@@ -192,7 +189,6 @@ public class PartialPathCompletionContributor extends CompletionContributor {
 
         int end = offset;
         if (end > fileText.length()) end = fileText.length();
-
         while (end > idx && Character.isWhitespace(fileText.charAt(end - 1))) end--;
 
         if (hadQuotes) {
@@ -210,8 +206,7 @@ public class PartialPathCompletionContributor extends CompletionContributor {
     }
 
     private static class TextRangeWithQuotes {
-        final int startOffset;
-        final int endOffset;
+        final int startOffset, endOffset;
         final String text;
         final boolean hadQuotes;
 
@@ -231,9 +226,7 @@ public class PartialPathCompletionContributor extends CompletionContributor {
     private static class RestoreQuotesInsertHandler implements InsertHandler<LookupElement> {
         private final Project project;
 
-        RestoreQuotesInsertHandler(Project project) {
-            this.project = project;
-        }
+        RestoreQuotesInsertHandler(Project project) { this.project = project; }
 
         @Override
         public void handleInsert(@NotNull InsertionContext ctx, @NotNull LookupElement item) {
@@ -246,7 +239,6 @@ public class PartialPathCompletionContributor extends CompletionContributor {
             final int insertEnd = ctx.getTailOffset();
 
             WriteCommandAction.runWriteCommandAction(project, () -> {
-                // определяем полный путь внутри {{> }}
                 int pathStart = doc.getText().lastIndexOf("{{>", Math.max(0, insertStart - 1)) + 3;
                 while (pathStart < doc.getTextLength() && Character.isWhitespace(doc.getCharsSequence().charAt(pathStart))) pathStart++;
 
@@ -266,7 +258,6 @@ public class PartialPathCompletionContributor extends CompletionContributor {
                 // курсор сразу после вставленного сегмента
                 editor.getCaretModel().moveToOffset(insertEnd + 1);
                 PsiDocumentManager.getInstance(project).commitDocument(doc);
-
                 editor.putUserData(REMOVED_QUOTES_KEY, null);
             });
         }
