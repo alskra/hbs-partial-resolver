@@ -25,18 +25,15 @@ import java.util.stream.Collectors;
 
 /**
  * Completion contributor that physically removes surrounding quotes before completion
- * (so user sees path without quotes), and restores quotes on insert.
+ * (so user sees path without quotes), and restores quotes on insert around the entire path.
  */
 public class PartialPathCompletionContributor extends CompletionContributor {
 
-    // Pattern splits segments: quoted or unquoted segment between slashes
     private static final Pattern SEGMENT_PATTERN = Pattern.compile("\"([^\"]*)\"|'([^']*)'|([^/]+)");
 
-    // Key to store info that quotes were removed in beforeCompletion
     private static final Key<QuoteRemovalInfo> REMOVED_QUOTES_KEY = Key.create("hbs.removedQuotes");
 
     public PartialPathCompletionContributor() {
-        // provider for completion items themselves (after beforeCompletion may have removed quotes)
         extend(CompletionType.BASIC, PlatformPatterns.psiElement(), new CompletionProvider<CompletionParameters>() {
             @Override
             protected void addCompletions(@NotNull CompletionParameters parameters,
@@ -51,13 +48,11 @@ public class PartialPathCompletionContributor extends CompletionContributor {
                 Document document = editor.getDocument();
                 int offset = parameters.getOffset();
 
-                // получаем текущий (возможно уже без кавычек) путь и диапазон
                 TextRangeWithQuotes range = getPathRangeAroundOffset(document.getText(), offset);
                 if (range == null) return;
 
-                String rawPath = range.text; // это уже то, что между {{> и курсором (может быть без кавычек если beforeCompletion сработал)
+                String rawPath = range.text;
 
-                // Разбираем сегменты корректно
                 List<String> segments = new ArrayList<>();
                 Matcher m = SEGMENT_PATTERN.matcher(rawPath);
                 while (m.find()) {
@@ -82,10 +77,8 @@ public class PartialPathCompletionContributor extends CompletionContributor {
                     prefix = "";
                 }
 
-                // resolve parent dir using existing PathResolver
                 VirtualFile parentDir = resolveParentDir(project, traverse);
 
-                // build candidate list (from parent dir or from project roots)
                 List<VirtualFile> roots = new ArrayList<>();
                 roots.addAll(Arrays.asList(ProjectRootManager.getInstance(project).getContentSourceRoots()));
                 roots.add(project.getBaseDir());
@@ -97,11 +90,9 @@ public class PartialPathCompletionContributor extends CompletionContributor {
                     String name = child.isDirectory() ? child.getName() : child.getNameWithoutExtension();
                     String key = child.getPath() + "::" + name;
                     if (name.contains(prefix) && seen.add(key)) {
-                        // show lookup element; show plain name in popup (quotes removed in editor)
                         LookupElementBuilder builder = LookupElementBuilder.create(name)
                                 .withIcon(child.isDirectory() ? AllIcons.Nodes.Folder : child.getFileType().getIcon());
 
-                        // Attach InsertHandler which will restore quotes if we removed them earlier
                         LookupElement le = builder.withInsertHandler(new RestoreQuotesInsertHandler(project));
                         result.addElement(le);
                     }
@@ -110,7 +101,6 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         });
     }
 
-    // BEFORE completion: physically remove quotes if cursor is inside a quoted path
     @Override
     public void beforeCompletion(@NotNull CompletionInitializationContext ctx) {
         Editor editor = ctx.getEditor();
@@ -120,7 +110,6 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         int caret = editor.getCaretModel().getOffset();
         String text = doc.getText();
 
-        // find opening '{{>' before caret
         int open = text.lastIndexOf("{{>", Math.max(0, caret - 1));
         if (open == -1) return;
 
@@ -130,11 +119,10 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         if (idx >= text.length()) return;
 
         char ch = text.charAt(idx);
-        if (ch != '"' && ch != '\'') return; // no opening quote -> nothing to do
+        if (ch != '"' && ch != '\'') return;
 
         final char quoteChar = ch;
 
-        // find end of path (closing quote or whitespace or '}}')
         int search = idx + 1;
         int closeQuotePos = -1;
         while (search < text.length()) {
@@ -143,38 +131,25 @@ public class PartialPathCompletionContributor extends CompletionContributor {
                 closeQuotePos = search;
                 break;
             } else if (c == '}' || Character.isWhitespace(c)) {
-                // reached end without matching quote
                 break;
             }
             search++;
         }
 
-        if (closeQuotePos == -1) {
-            // no matching closing quote found — abort safe
-            return;
-        }
+        if (closeQuotePos == -1) return;
 
         final int openQuoteOffset = idx;
         final int closeQuoteOffset = closeQuotePos;
 
-        // perform deletion inside write command (beforeCompletion is allowed to write)
-        // but still use WriteCommandAction to support undo/redo
         WriteCommandAction.runWriteCommandAction(project, () -> {
-            // re-check bounds (document could change between reading and write)
             if (openQuoteOffset < 0 || closeQuoteOffset >= doc.getTextLength()) return;
             CharSequence cs = doc.getCharsSequence();
-            if (cs.charAt(openQuoteOffset) != quoteChar) return;
-            if (cs.charAt(closeQuoteOffset) != quoteChar) return;
+            if (cs.charAt(openQuoteOffset) != quoteChar || cs.charAt(closeQuoteOffset) != quoteChar) return;
 
-            // delete closing first (higher index), then opening
             doc.deleteString(closeQuoteOffset, closeQuoteOffset + 1);
             doc.deleteString(openQuoteOffset, openQuoteOffset + 1);
-
-            // commit changes so completion sees updated document
             PsiDocumentManager.getInstance(project).commitDocument(doc);
 
-            // mark on the editor that we removed quotes (store quoteChar)
-            // store minimal info: that quotes were removed and which char
             editor.putUserData(REMOVED_QUOTES_KEY, new QuoteRemovalInfo(quoteChar));
         });
     }
@@ -199,11 +174,6 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         }
     }
 
-    /**
-     * Finds a "path range" around the offset: looks back for "{{>" and returns the substring between
-     * after the opening quote (if present) and the next whitespace/}}/closing quote. Also reports if originally had quotes.
-     * NOTE: this method is tolerant: it returns best-effort range whether or not quotes currently present.
-     */
     @Nullable
     private TextRangeWithQuotes getPathRangeAroundOffset(String fileText, int offset) {
         int start = fileText.lastIndexOf("{{>", Math.max(0, offset - 1));
@@ -219,37 +189,29 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         if (fileText.charAt(idx) == '"' || fileText.charAt(idx) == '\'') {
             hadQuotes = true;
             quoteChar = fileText.charAt(idx);
-            idx++; // move inside quotes
+            idx++;
         }
 
         int end = offset;
-        // extend end to the next boundary (}} or whitespace) if cursor beyond that
         if (end > fileText.length()) end = fileText.length();
-
-        // trim trailing whitespace from considered end
         while (end > idx && Character.isWhitespace(fileText.charAt(end - 1))) end--;
 
-        // if had quotes, try to include until the closing quote if it exists
         if (hadQuotes) {
             int close = fileText.indexOf(quoteChar, idx);
             if (close != -1 && close >= idx) {
-                // ensure we don't go beyond close quote for the text field
                 int extractEnd = Math.min(end, close);
-                String text = fileText.substring(idx, extractEnd);
-                return new TextRangeWithQuotes(idx, extractEnd, text, true);
+                return new TextRangeWithQuotes(idx, extractEnd, fileText.substring(idx, extractEnd), true);
             }
         }
 
-        // default: return substring idx..end (may be empty)
         if (idx > end) return new TextRangeWithQuotes(idx, idx, "", hadQuotes);
-        String text = fileText.substring(idx, end);
-        return new TextRangeWithQuotes(idx, end, text, hadQuotes);
+        return new TextRangeWithQuotes(idx, end, fileText.substring(idx, end), hadQuotes);
     }
 
     private static class TextRangeWithQuotes {
-        final int startOffset; // offset where the path (without surrounding quotes) starts in document
-        final int endOffset;   // offset where the path (without surrounding quotes) ends (exclusive)
-        final String text;     // text content between startOffset and endOffset
+        final int startOffset;
+        final int endOffset;
+        final String text;
         final boolean hadQuotes;
 
         TextRangeWithQuotes(int startOffset, int endOffset, String text, boolean hadQuotes) {
@@ -260,15 +222,11 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         }
     }
 
-    // Minimal info stored when we remove quotes
     private static class QuoteRemovalInfo {
         final char quoteChar;
         QuoteRemovalInfo(char quoteChar) { this.quoteChar = quoteChar; }
     }
 
-    /**
-     * InsertHandler that restores quotes if they were removed in beforeCompletion.
-     */
     private static class RestoreQuotesInsertHandler implements InsertHandler<LookupElement> {
         private final Project project;
 
@@ -280,48 +238,35 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         public void handleInsert(@NotNull InsertionContext ctx, @NotNull LookupElement item) {
             final Editor editor = ctx.getEditor();
             final QuoteRemovalInfo info = editor.getUserData(REMOVED_QUOTES_KEY);
-            if (info == null) return; // nothing to restore
+            if (info == null) return;
 
             final Document doc = ctx.getDocument();
-            final int start = ctx.getStartOffset();
-            final int tail = ctx.getTailOffset(); // tail after insertion
 
-            // Use mutable holder so we can change it inside the write lambda
-            final int[] tailRef = new int[]{ tail };
-
-            // Do the restore in a write command so undo/redo works
             WriteCommandAction.runWriteCommandAction(project, () -> {
-                // Safeguard: ensure we don't insert quotes where they already exist
+                int caret = editor.getCaretModel().getOffset();
+                String text = doc.getText();
+
+                int start = text.lastIndexOf("{{>", Math.max(0, caret - 1));
+                if (start == -1) return;
+                start += 3;
+                while (start < text.length() && Character.isWhitespace(text.charAt(start))) start++;
+
+                int end = text.indexOf("}}", start);
+                if (end == -1) end = text.length();
+
+                while (end > start && Character.isWhitespace(text.charAt(end - 1))) end--;
+
                 CharSequence cs = doc.getCharsSequence();
-
-                boolean openPresent = start - 1 >= 0 && (cs.charAt(start - 1) == info.quoteChar);
-                if (!openPresent) {
+                if (start >= doc.getTextLength() || cs.charAt(start) != info.quoteChar) {
                     doc.insertString(start, String.valueOf(info.quoteChar));
-                    // inserted one char before the inserted text -> tail shifts by +1
-                    tailRef[0] = tailRef[0] + 1;
+                    end += 1;
+                }
+                if (end >= doc.getTextLength() || cs.charAt(end) != info.quoteChar) {
+                    doc.insertString(end, String.valueOf(info.quoteChar));
                 }
 
-                // recompute close presence using updated tailRef
-                boolean closePresent = tailRef[0] < doc.getTextLength() && (doc.getCharsSequence().charAt(tailRef[0]) == info.quoteChar);
-                if (!closePresent) {
-                    int pos = Math.min(tailRef[0], doc.getTextLength());
-                    doc.insertString(pos, String.valueOf(info.quoteChar));
-                }
-
-                // move caret to the end of inserted text inside quotes
-                int newCaret;
-                if (openPresent) {
-                    newCaret = start + (tailRef[0] - start);
-                } else {
-                    newCaret = start + 1 + (tailRef[0] - start);
-                }
-
-                // Bound newCaret to document length
-                newCaret = Math.max(0, Math.min(newCaret, doc.getTextLength()));
-                ctx.getEditor().getCaretModel().moveToOffset(newCaret);
+                editor.getCaretModel().moveToOffset(end + 1);
                 PsiDocumentManager.getInstance(project).commitDocument(doc);
-
-                // clear the marker so repeated inserts won't try to restore again
                 editor.putUserData(REMOVED_QUOTES_KEY, null);
             });
         }
