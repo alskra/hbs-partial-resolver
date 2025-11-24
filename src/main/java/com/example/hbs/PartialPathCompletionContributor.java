@@ -213,10 +213,8 @@ public class PartialPathCompletionContributor extends CompletionContributor {
 
             PsiDocumentManager.getInstance(project).commitDocument(doc);
 
-            // перемещаем курсор к прежней позиции внутри сегмента
-            int newCaret = Math.min(Math.max(caret + 1, idx + 1), pathEnd + 1);
-            editor.getCaretModel().moveToOffset(newCaret);
-
+            // курсор после сегмента
+            editor.getCaretModel().moveToOffset(pathEnd + 1);
             editor.putUserData(REMOVED_QUOTES_KEY, null);
         });
     }
@@ -348,9 +346,8 @@ public class PartialPathCompletionContributor extends CompletionContributor {
                     doc.insertString(pathEnd, String.valueOf(info.quoteChar));
                 }
 
-                // сохраняем позицию курсора внутри сегмента
-                int newCaret = Math.min(Math.max(caretOffset, pathStart + (opened ? 1 : 0)), pathEnd);
-                editor.getCaretModel().moveToOffset(newCaret);
+                // курсор строго после вставленного сегмента
+                editor.getCaretModel().moveToOffset(pathEnd);
 
                 PsiDocumentManager.getInstance(project).commitDocument(doc);
                 editor.putUserData(REMOVED_QUOTES_KEY, null);
