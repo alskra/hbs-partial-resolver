@@ -1,9 +1,11 @@
 package com.example.hbs;
 
 import com.intellij.codeInsight.completion.*;
-import com.intellij.codeInsight.lookup.LookupElementBuilder;
-import com.intellij.codeInsight.lookup.LookupElement;
+import com.intellij.codeInsight.lookup.*;
+import com.intellij.codeInsight.lookup.LookupManager;
+import com.intellij.codeInsight.lookup.LookupEvent;
 import com.intellij.icons.AllIcons;
+import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.command.WriteCommandAction;
 import com.intellij.openapi.editor.Document;
 import com.intellij.openapi.editor.Editor;
@@ -23,10 +25,15 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+/**
+ * Completion contributor that physically removes surrounding quotes before completion
+ * and restores them on insert or when the lookup is cancelled.
+ */
 public class PartialPathCompletionContributor extends CompletionContributor {
 
     private static final Pattern SEGMENT_PATTERN = Pattern.compile("\"([^\"]*)\"|'([^']*)'|([^/]+)");
     private static final Key<QuoteRemovalInfo> REMOVED_QUOTES_KEY = Key.create("hbs.removedQuotes");
+    private static final Key<LookupListener> LOOKUP_LISTENER_KEY = Key.create("hbs.lookup.listener");
 
     public PartialPathCompletionContributor() {
         extend(CompletionType.BASIC, PlatformPatterns.psiElement(), new CompletionProvider<CompletionParameters>() {
@@ -127,16 +134,114 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         final int openQuoteOffset = idx;
         final int closeQuoteOffset = closeQuotePos;
 
+        // perform deletion inside write command (beforeCompletion allowed to write)
         WriteCommandAction.runWriteCommandAction(project, () -> {
             if (openQuoteOffset < 0 || closeQuoteOffset >= doc.getTextLength()) return;
             CharSequence cs = doc.getCharsSequence();
             if (cs.charAt(openQuoteOffset) != quoteChar || cs.charAt(closeQuoteOffset) != quoteChar) return;
 
+            // delete closing first (higher index), then opening
             doc.deleteString(closeQuoteOffset, closeQuoteOffset + 1);
             doc.deleteString(openQuoteOffset, openQuoteOffset + 1);
 
             PsiDocumentManager.getInstance(project).commitDocument(doc);
+
+            // mark that we removed quotes and which char
             editor.putUserData(REMOVED_QUOTES_KEY, new QuoteRemovalInfo(quoteChar));
+
+            // attach lookup listener so we can restore quotes if lookup is cancelled
+            attachLookupListenerForEditor(project, editor);
+        });
+    }
+
+    // attach listener to active lookup (or shortly after if not yet created)
+    private void attachLookupListenerForEditor(Project project, Editor editor) {
+        Lookup active = LookupManager.getInstance(project).getActiveLookup(editor);
+        if (active != null) {
+            addListenerToLookup(active, editor, project);
+            return;
+        }
+        // lookup might be created just after beforeCompletion — try again on EDT
+        ApplicationManager.getApplication().invokeLater(() -> {
+            Lookup later = LookupManager.getInstance(project).getActiveLookup(editor);
+            if (later != null) addListenerToLookup(later, editor, project);
+        });
+    }
+
+    private void addListenerToLookup(Lookup lookup, Editor editor, Project project) {
+        if (lookup == null) return;
+        // if already attached, skip
+        LookupListener existing = editor.getUserData(LOOKUP_LISTENER_KEY);
+        if (existing != null) return;
+
+        LookupListener listener = new LookupListener() {
+            @Override
+            public void itemSelected(@NotNull LookupEvent event) {
+                // selection — cleanup listener (InsertHandler will restore quotes)
+                editor.putUserData(LOOKUP_LISTENER_KEY, null);
+            }
+
+            @Override
+            public void lookupCanceled(@NotNull LookupEvent event) {
+                // canceled -> restore quotes physically
+                restoreQuotesPhysically(editor, project);
+                editor.putUserData(LOOKUP_LISTENER_KEY, null);
+            }
+        };
+        lookup.addLookupListener(listener);
+        editor.putUserData(LOOKUP_LISTENER_KEY, listener);
+    }
+
+    // physically restore quotes around current path (used on cancel)
+    private void restoreQuotesPhysically(Editor editor, Project project) {
+        Document doc = editor.getDocument();
+        WriteCommandAction.runWriteCommandAction(project, () -> {
+            String text = doc.getText();
+            int caret = editor.getCaretModel().getOffset();
+
+            int start = text.lastIndexOf("{{>", Math.max(0, caret - 1));
+            if (start == -1) return;
+            int idx = start + 3;
+            while (idx < text.length() && Character.isWhitespace(text.charAt(idx))) idx++;
+            if (idx >= text.length()) return;
+
+            // if quotes already present, nothing to do
+            char first = text.charAt(idx);
+            boolean alreadyQuoted = (first == '"' || first == '\'');
+            if (alreadyQuoted) return;
+
+            // find end of path (stop at whitespace or '}' to avoid capturing params)
+            int pathEnd = idx;
+            while (pathEnd < text.length()) {
+                char c = text.charAt(pathEnd);
+                if (Character.isWhitespace(c) || c == '}') break;
+                pathEnd++;
+            }
+
+            // preserve original quote char if available
+            QuoteRemovalInfo info = editor.getUserData(REMOVED_QUOTES_KEY);
+            char q = (info != null) ? info.quoteChar : '"';
+
+            boolean opened = false;
+            // insert opening
+            doc.insertString(idx, String.valueOf(q));
+            opened = true;
+            // insert closing at pathEnd+1 (because we inserted one char before)
+            int closePos = Math.min(doc.getTextLength(), pathEnd + 1);
+            doc.insertString(closePos, String.valueOf(q));
+
+            PsiDocumentManager.getInstance(project).commitDocument(doc);
+
+            // move caret to correct position:
+            // caret was the position before restore; after inserting opening quote before caret,
+            // caret should shift by +1 if it was after insertion point.
+            int newCaret = caret;
+            if (caret >= idx) newCaret = caret + (opened ? 1 : 0);
+            newCaret = Math.max(0, Math.min(newCaret, doc.getTextLength()));
+            editor.getCaretModel().moveToOffset(newCaret);
+
+            // clear removal marker
+            editor.putUserData(REMOVED_QUOTES_KEY, null);
         });
     }
 
@@ -231,6 +336,14 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         @Override
         public void handleInsert(@NotNull InsertionContext ctx, @NotNull LookupElement item) {
             final Editor editor = ctx.getEditor();
+            // If we attached a lookup listener, remove it (selection path)
+            LookupListener listener = editor.getUserData(LOOKUP_LISTENER_KEY);
+            if (listener != null) {
+                Lookup active = LookupManager.getInstance(project).getActiveLookup(editor);
+                if (active != null) active.removeLookupListener(listener);
+                editor.putUserData(LOOKUP_LISTENER_KEY, null);
+            }
+
             final QuoteRemovalInfo info = editor.getUserData(REMOVED_QUOTES_KEY);
             if (info == null) return;
 
