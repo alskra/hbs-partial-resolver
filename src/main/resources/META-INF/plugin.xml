@@ -10,6 +10,8 @@
 
     <extensions defaultExtensionNs="com.intellij">
         <psi.referenceContributor language="Handlebars" implementation="com.example.hbs.PsiPartialReferenceContributor"/>
+        <renameHandler implementation="com.example.hbs.HbsPartialRenameHandler"/>
+
 		<completion.contributor language="Handlebars" implementationClass="com.example.hbs.PartialPathCompletionContributor"/>
 		<postStartupActivity implementation="com.example.hbs.HbsStartupActivity"/>
 	</extensions>
