@@ -76,18 +76,18 @@ class SegmentReference(
 
         val fullSourcePath = segments.joinToString("/")
 
-        // Выбираем базу для относительного пути
-        val sourceRoot = ReadAction.compute<List<VirtualFile>, RuntimeException> { resolver.getRoots() }
-            .firstOrNull { VfsUtilCore.isAncestor(it, sourceVf, true) }
-        val targetRelative: String = if (fullSourcePath.contains("/")) {
-            // Если путь изначально был с root — сохраняем root
-            VfsUtilCore.getRelativePath(targetVf, sourceRoot ?: project.baseDir, '/')?.removeSuffix(".hbs")
-                ?: targetVf.nameWithoutExtension
+        // Получаем все sources root из настроек IDE
+        val sourceRoots = ReadAction.compute<List<VirtualFile>, RuntimeException> { resolver.getRoots() }
+
+        // Ищем sources root, в котором находится target
+        val rootContainingTarget = sourceRoots.firstOrNull { VfsUtilCore.isAncestor(it, targetVf, true) }
+
+        // Строим путь с приоритетом sources root, иначе fallback на parent исходного файла
+        val targetRelative: String = if (rootContainingTarget != null) {
+            VfsUtilCore.getRelativePath(targetVf, rootContainingTarget, '/')?.removeSuffix(".hbs")
         } else {
-            // локальный путь — относительно текущей директории
             VfsUtilCore.getRelativePath(targetVf, sourceVf.parent, '/')?.removeSuffix(".hbs")
-                ?: targetVf.nameWithoutExtension
-        }
+        } ?: targetVf.nameWithoutExtension
 
         val replacement = targetRelative
 

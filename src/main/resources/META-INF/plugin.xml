@@ -12,6 +12,12 @@
         <psi.referenceContributor language="Handlebars" implementation="com.example.hbs.PsiPartialReferenceContributor"/>
 		<completion.contributor language="Handlebars" implementationClass="com.example.hbs.PartialPathCompletionContributor"/>
 		<postStartupActivity implementation="com.example.hbs.HbsStartupActivity"/>
+
+        <!-- Rename handler для .hbs -->
+        <renameHandler implementation="com.example.hbs.HbsPartialRenameHandler"/>
+
+        <!-- Move handler для .hbs -->
+        <moveHandler implementation="com.example.hbs.HbsPartialMoveHandler"/>
 	</extensions>
 
     <description>
