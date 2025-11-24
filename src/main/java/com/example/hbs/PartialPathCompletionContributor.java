@@ -26,8 +26,8 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * Completion contributor that physically removes surrounding quotes before completion
- * and restores them on insert or when the lookup is cancelled.
+ * Completion contributor that removes quotes before completion
+ * and restores them on insert or cancel, preserving cursor position.
  */
 public class PartialPathCompletionContributor extends CompletionContributor {
 
@@ -45,12 +45,12 @@ public class PartialPathCompletionContributor extends CompletionContributor {
                 PsiFile psiFile = parameters.getOriginalFile();
                 if (!psiFile.getName().endsWith(".hbs")) return;
 
-                Project project = psiFile.getProject();
                 Editor editor = parameters.getEditor();
-                Document document = editor.getDocument();
+                Document doc = editor.getDocument();
                 int offset = parameters.getOffset();
+                String text = doc.getText();
 
-                TextRangeWithQuotes range = getPathRangeAroundOffset(document.getText(), offset);
+                TextRangeWithQuotes range = getPathRangeAroundOffset(text, offset);
                 if (range == null) return;
 
                 String rawPath = range.text;
@@ -78,11 +78,11 @@ public class PartialPathCompletionContributor extends CompletionContributor {
                     prefix = "";
                 }
 
-                VirtualFile parentDir = resolveParentDir(project, traverse);
+                VirtualFile parentDir = resolveParentDir(psiFile.getProject(), traverse);
                 if (parentDir == null || !parentDir.exists()) return;
 
                 boolean firstSegment = traverse.isEmpty();
-                List<VirtualFile> candidates = getCandidates(parentDir, firstSegment, project);
+                List<VirtualFile> candidates = getCandidates(parentDir, firstSegment, psiFile.getProject());
 
                 Set<String> seen = new HashSet<>();
                 for (VirtualFile child : candidates) {
@@ -91,9 +91,7 @@ public class PartialPathCompletionContributor extends CompletionContributor {
                     if (name.contains(prefix) && seen.add(key)) {
                         LookupElementBuilder builder = LookupElementBuilder.create(name)
                                 .withIcon(child.isDirectory() ? AllIcons.Nodes.Folder : child.getFileType().getIcon());
-
-                        LookupElement le = builder.withInsertHandler(new RestoreQuotesInsertHandler(project));
-                        result.addElement(le);
+                        result.addElement(builder.withInsertHandler(new RestoreQuotesInsertHandler(psiFile.getProject(), range, offset)));
                     }
                 }
             }
@@ -105,17 +103,23 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         Editor editor = ctx.getEditor();
         Document doc = editor.getDocument();
         Project project = ctx.getProject();
-
         int caret = editor.getCaretModel().getOffset();
         String text = doc.getText();
 
-        int open = text.lastIndexOf("{{>", Math.max(0, caret - 1));
-        if (open == -1) return;
+        int start = text.lastIndexOf("{{>", Math.max(0, caret - 1));
+        if (start == -1) return;
 
-        int idx = open + 3;
+        int idx = start + 3;
         while (idx < text.length() && Character.isWhitespace(text.charAt(idx))) idx++;
-
         if (idx >= text.length()) return;
+
+        int pathEnd = idx;
+        while (pathEnd < text.length()) {
+            char c = text.charAt(pathEnd);
+            if (Character.isWhitespace(c) || c == '}') break;
+            pathEnd++;
+        }
+        if (caret > pathEnd) return;
 
         char ch = text.charAt(idx);
         if (ch != '"' && ch != '\'') return;
@@ -134,34 +138,26 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         final int openQuoteOffset = idx;
         final int closeQuoteOffset = closeQuotePos;
 
-        // perform deletion inside write command (beforeCompletion allowed to write)
         WriteCommandAction.runWriteCommandAction(project, () -> {
-            if (openQuoteOffset < 0 || closeQuoteOffset >= doc.getTextLength()) return;
             CharSequence cs = doc.getCharsSequence();
             if (cs.charAt(openQuoteOffset) != quoteChar || cs.charAt(closeQuoteOffset) != quoteChar) return;
 
-            // delete closing first (higher index), then opening
             doc.deleteString(closeQuoteOffset, closeQuoteOffset + 1);
             doc.deleteString(openQuoteOffset, openQuoteOffset + 1);
 
             PsiDocumentManager.getInstance(project).commitDocument(doc);
 
-            // mark that we removed quotes and which char
-            editor.putUserData(REMOVED_QUOTES_KEY, new QuoteRemovalInfo(quoteChar));
-
-            // attach lookup listener so we can restore quotes if lookup is cancelled
+            editor.putUserData(REMOVED_QUOTES_KEY, new QuoteRemovalInfo(quoteChar, openQuoteOffset));
             attachLookupListenerForEditor(project, editor);
         });
     }
 
-    // attach listener to active lookup (or shortly after if not yet created)
     private void attachLookupListenerForEditor(Project project, Editor editor) {
         Lookup active = LookupManager.getInstance(project).getActiveLookup(editor);
         if (active != null) {
             addListenerToLookup(active, editor, project);
             return;
         }
-        // lookup might be created just after beforeCompletion — try again on EDT
         ApplicationManager.getApplication().invokeLater(() -> {
             Lookup later = LookupManager.getInstance(project).getActiveLookup(editor);
             if (later != null) addListenerToLookup(later, editor, project);
@@ -170,20 +166,17 @@ public class PartialPathCompletionContributor extends CompletionContributor {
 
     private void addListenerToLookup(Lookup lookup, Editor editor, Project project) {
         if (lookup == null) return;
-        // if already attached, skip
         LookupListener existing = editor.getUserData(LOOKUP_LISTENER_KEY);
         if (existing != null) return;
 
         LookupListener listener = new LookupListener() {
             @Override
             public void itemSelected(@NotNull LookupEvent event) {
-                // selection — cleanup listener (InsertHandler will restore quotes)
                 editor.putUserData(LOOKUP_LISTENER_KEY, null);
             }
 
             @Override
             public void lookupCanceled(@NotNull LookupEvent event) {
-                // canceled -> restore quotes physically
                 restoreQuotesPhysically(editor, project);
                 editor.putUserData(LOOKUP_LISTENER_KEY, null);
             }
@@ -192,25 +185,22 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         editor.putUserData(LOOKUP_LISTENER_KEY, listener);
     }
 
-    // physically restore quotes around current path (used on cancel)
     private void restoreQuotesPhysically(Editor editor, Project project) {
         Document doc = editor.getDocument();
         WriteCommandAction.runWriteCommandAction(project, () -> {
-            String text = doc.getText();
+            QuoteRemovalInfo info = editor.getUserData(REMOVED_QUOTES_KEY);
+            if (info == null) return;
+
             int caret = editor.getCaretModel().getOffset();
+            String text = doc.getText();
 
             int start = text.lastIndexOf("{{>", Math.max(0, caret - 1));
             if (start == -1) return;
+
             int idx = start + 3;
             while (idx < text.length() && Character.isWhitespace(text.charAt(idx))) idx++;
             if (idx >= text.length()) return;
 
-            // if quotes already present, nothing to do
-            char first = text.charAt(idx);
-            boolean alreadyQuoted = (first == '"' || first == '\'');
-            if (alreadyQuoted) return;
-
-            // find end of path (stop at whitespace or '}' to avoid capturing params)
             int pathEnd = idx;
             while (pathEnd < text.length()) {
                 char c = text.charAt(pathEnd);
@@ -218,29 +208,15 @@ public class PartialPathCompletionContributor extends CompletionContributor {
                 pathEnd++;
             }
 
-            // preserve original quote char if available
-            QuoteRemovalInfo info = editor.getUserData(REMOVED_QUOTES_KEY);
-            char q = (info != null) ? info.quoteChar : '"';
-
-            boolean opened = false;
-            // insert opening
-            doc.insertString(idx, String.valueOf(q));
-            opened = true;
-            // insert closing at pathEnd+1 (because we inserted one char before)
-            int closePos = Math.min(doc.getTextLength(), pathEnd + 1);
-            doc.insertString(closePos, String.valueOf(q));
+            doc.insertString(idx, String.valueOf(info.quoteChar));
+            doc.insertString(pathEnd + 1, String.valueOf(info.quoteChar));
 
             PsiDocumentManager.getInstance(project).commitDocument(doc);
 
-            // move caret to correct position:
-            // caret was the position before restore; after inserting opening quote before caret,
-            // caret should shift by +1 if it was after insertion point.
-            int newCaret = caret;
-            if (caret >= idx) newCaret = caret + (opened ? 1 : 0);
-            newCaret = Math.max(0, Math.min(newCaret, doc.getTextLength()));
+            // перемещаем курсор к прежней позиции внутри сегмента
+            int newCaret = Math.min(Math.max(caret + 1, idx + 1), pathEnd + 1);
             editor.getCaretModel().moveToOffset(newCaret);
 
-            // clear removal marker
             editor.putUserData(REMOVED_QUOTES_KEY, null);
         });
     }
@@ -248,10 +224,7 @@ public class PartialPathCompletionContributor extends CompletionContributor {
     @Nullable
     private VirtualFile resolveParentDir(Project project, List<String> traverse) {
         PathResolver resolver = new PathResolver(project);
-        if (traverse.isEmpty()) {
-            // первый сегмент — берем корни проекта
-            return project.getBaseDir();
-        }
+        if (traverse.isEmpty()) return project.getBaseDir();
         return resolver.resolveSegmentToVirtualFile(traverse, traverse.size() - 1, false);
     }
 
@@ -261,10 +234,8 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         List<VirtualFile> roots = new ArrayList<>();
         if (firstSegment) {
             roots.addAll(Arrays.asList(ProjectRootManager.getInstance(project).getContentSourceRoots()));
-            roots.add(parentDir); // Project Root
-        } else {
             roots.add(parentDir);
-        }
+        } else roots.add(parentDir);
 
         List<VirtualFile> result = new ArrayList<>();
         for (VirtualFile root : roots) {
@@ -284,6 +255,14 @@ public class PartialPathCompletionContributor extends CompletionContributor {
         while (idx < fileText.length() && Character.isWhitespace(fileText.charAt(idx))) idx++;
         if (idx >= fileText.length()) return null;
 
+        int pathEnd = idx;
+        while (pathEnd < fileText.length()) {
+            char c = fileText.charAt(pathEnd);
+            if (Character.isWhitespace(c) || c == '}') break;
+            pathEnd++;
+        }
+        if (offset > pathEnd) return null;
+
         boolean hadQuotes = false;
         char quoteChar = 0;
         if (fileText.charAt(idx) == '"' || fileText.charAt(idx) == '\'') {
@@ -292,22 +271,8 @@ public class PartialPathCompletionContributor extends CompletionContributor {
             idx++;
         }
 
-        int end = offset;
-        if (end > fileText.length()) end = fileText.length();
-        while (end > idx && Character.isWhitespace(fileText.charAt(end - 1))) end--;
-
-        if (hadQuotes) {
-            int close = fileText.indexOf(quoteChar, idx);
-            if (close != -1 && close >= idx) {
-                int extractEnd = Math.min(end, close);
-                String text = fileText.substring(idx, extractEnd);
-                return new TextRangeWithQuotes(idx, extractEnd, text, true);
-            }
-        }
-
-        if (idx > end) return new TextRangeWithQuotes(idx, idx, "", hadQuotes);
-        String text = fileText.substring(idx, end);
-        return new TextRangeWithQuotes(idx, end, text, hadQuotes);
+        String text = fileText.substring(idx, offset);
+        return new TextRangeWithQuotes(idx, offset, text, hadQuotes);
     }
 
     private static class TextRangeWithQuotes {
@@ -325,18 +290,27 @@ public class PartialPathCompletionContributor extends CompletionContributor {
 
     private static class QuoteRemovalInfo {
         final char quoteChar;
-        QuoteRemovalInfo(char quoteChar) { this.quoteChar = quoteChar; }
+        final int originalOffset;
+        QuoteRemovalInfo(char quoteChar, int originalOffset) {
+            this.quoteChar = quoteChar;
+            this.originalOffset = originalOffset;
+        }
     }
 
     private static class RestoreQuotesInsertHandler implements InsertHandler<LookupElement> {
         private final Project project;
+        private final TextRangeWithQuotes range;
+        private final int caretOffset;
 
-        RestoreQuotesInsertHandler(Project project) { this.project = project; }
+        RestoreQuotesInsertHandler(Project project, TextRangeWithQuotes range, int caretOffset) {
+            this.project = project;
+            this.range = range;
+            this.caretOffset = caretOffset;
+        }
 
         @Override
         public void handleInsert(@NotNull InsertionContext ctx, @NotNull LookupElement item) {
             final Editor editor = ctx.getEditor();
-            // If we attached a lookup listener, remove it (selection path)
             LookupListener listener = editor.getUserData(LOOKUP_LISTENER_KEY);
             if (listener != null) {
                 Lookup active = LookupManager.getInstance(project).getActiveLookup(editor);
@@ -348,19 +322,13 @@ public class PartialPathCompletionContributor extends CompletionContributor {
             if (info == null) return;
 
             final Document doc = ctx.getDocument();
-            final int insertStart = ctx.getStartOffset();
-            final int insertEnd = ctx.getTailOffset();
-
             WriteCommandAction.runWriteCommandAction(project, () -> {
-                // get fresh text & chars
                 String text = doc.getText();
                 CharSequence cs = doc.getCharsSequence();
 
-                // start of path (after "{{>")
-                int pathStart = text.lastIndexOf("{{>", Math.max(0, insertStart - 1)) + 3;
+                int pathStart = text.lastIndexOf("{{>", Math.max(0, caretOffset - 1)) + 3;
                 while (pathStart < doc.getTextLength() && Character.isWhitespace(cs.charAt(pathStart))) pathStart++;
 
-                // determine path end: stop at first whitespace or '}' (so parameters are not included)
                 int pathEnd = pathStart;
                 while (pathEnd < doc.getTextLength()) {
                     char c = cs.charAt(pathEnd);
@@ -369,24 +337,19 @@ public class PartialPathCompletionContributor extends CompletionContributor {
                 }
 
                 boolean opened = false;
-                // insert opening quote if missing
                 if (pathStart >= doc.getTextLength() || cs.charAt(pathStart) != info.quoteChar) {
                     doc.insertString(pathStart, String.valueOf(info.quoteChar));
                     opened = true;
                     pathEnd += 1;
                 }
 
-                // refresh cs after potential insertion
                 cs = doc.getCharsSequence();
-
-                // insert closing quote if missing at pathEnd
                 if (pathEnd >= doc.getTextLength() || cs.charAt(pathEnd) != info.quoteChar) {
                     doc.insertString(pathEnd, String.valueOf(info.quoteChar));
                 }
 
-                // cursor immediately after inserted segment (account for inserted opening quote)
-                int newCaret = insertEnd + (opened ? 1 : 0);
-                newCaret = Math.max(0, Math.min(newCaret, doc.getTextLength()));
+                // сохраняем позицию курсора внутри сегмента
+                int newCaret = Math.min(Math.max(caretOffset, pathStart + (opened ? 1 : 0)), pathEnd);
                 editor.getCaretModel().moveToOffset(newCaret);
 
                 PsiDocumentManager.getInstance(project).commitDocument(doc);
