@@ -82,11 +82,11 @@ class SegmentReference(
         // Ищем sources root, в котором находится target
         val rootContainingTarget = sourceRoots.firstOrNull { VfsUtilCore.isAncestor(it, targetVf, true) }
 
-        // Строим путь с приоритетом sources root, иначе fallback на parent исходного файла
+        // Строим путь с приоритетом sources root, иначе fallback на корень проекта
         val targetRelative: String = if (rootContainingTarget != null) {
             VfsUtilCore.getRelativePath(targetVf, rootContainingTarget, '/')?.removeSuffix(".hbs")
         } else {
-            VfsUtilCore.getRelativePath(targetVf, sourceVf.parent, '/')?.removeSuffix(".hbs")
+            VfsUtilCore.getRelativePath(targetVf, project.baseDir, '/')?.removeSuffix(".hbs")
         } ?: targetVf.nameWithoutExtension
 
         val replacement = targetRelative
