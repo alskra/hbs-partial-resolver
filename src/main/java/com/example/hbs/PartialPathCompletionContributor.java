@@ -239,24 +239,43 @@ public class PartialPathCompletionContributor extends CompletionContributor {
             final int insertEnd = ctx.getTailOffset();
 
             WriteCommandAction.runWriteCommandAction(project, () -> {
-                int pathStart = doc.getText().lastIndexOf("{{>", Math.max(0, insertStart - 1)) + 3;
-                while (pathStart < doc.getTextLength() && Character.isWhitespace(doc.getCharsSequence().charAt(pathStart))) pathStart++;
-
-                int pathEnd = doc.getText().indexOf("}}", pathStart);
-                if (pathEnd == -1) pathEnd = doc.getTextLength();
-                while (pathEnd > pathStart && Character.isWhitespace(doc.getCharsSequence().charAt(pathEnd - 1))) pathEnd--;
-
+                // get fresh text & chars
+                String text = doc.getText();
                 CharSequence cs = doc.getCharsSequence();
+
+                // start of path (after "{{>")
+                int pathStart = text.lastIndexOf("{{>", Math.max(0, insertStart - 1)) + 3;
+                while (pathStart < doc.getTextLength() && Character.isWhitespace(cs.charAt(pathStart))) pathStart++;
+
+                // determine path end: stop at first whitespace or '}' (so parameters are not included)
+                int pathEnd = pathStart;
+                while (pathEnd < doc.getTextLength()) {
+                    char c = cs.charAt(pathEnd);
+                    if (Character.isWhitespace(c) || c == '}') break;
+                    pathEnd++;
+                }
+
+                boolean opened = false;
+                // insert opening quote if missing
                 if (pathStart >= doc.getTextLength() || cs.charAt(pathStart) != info.quoteChar) {
                     doc.insertString(pathStart, String.valueOf(info.quoteChar));
+                    opened = true;
                     pathEnd += 1;
                 }
+
+                // refresh cs after potential insertion
+                cs = doc.getCharsSequence();
+
+                // insert closing quote if missing at pathEnd
                 if (pathEnd >= doc.getTextLength() || cs.charAt(pathEnd) != info.quoteChar) {
                     doc.insertString(pathEnd, String.valueOf(info.quoteChar));
                 }
 
-                // курсор сразу после вставленного сегмента
-                editor.getCaretModel().moveToOffset(insertEnd + 1);
+                // cursor immediately after inserted segment (account for inserted opening quote)
+                int newCaret = insertEnd + (opened ? 1 : 0);
+                newCaret = Math.max(0, Math.min(newCaret, doc.getTextLength()));
+                editor.getCaretModel().moveToOffset(newCaret);
+
                 PsiDocumentManager.getInstance(project).commitDocument(doc);
                 editor.putUserData(REMOVED_QUOTES_KEY, null);
             });
