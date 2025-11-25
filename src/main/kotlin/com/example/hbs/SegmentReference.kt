@@ -13,6 +13,8 @@ import com.intellij.psi.PsiDocumentManager
 import com.intellij.openapi.vfs.VfsUtilCore
 import com.intellij.openapi.editor.Document
 import com.intellij.util.IncorrectOperationException
+import com.intellij.psi.PsiNamedElement
+import com.intellij.psi.PsiNameIdentifierOwner
 
 class SegmentReference(
     element: PsiElement,
@@ -59,39 +61,52 @@ class SegmentReference(
         }
     }
 
+    /**
+     * bindToElement — связывает ссылку с элементом. Не занимается физическим переименованием.
+     * При рефакторинге IDEA сама переименует файл/папку; здесь мы только формируем корректный текст ссылки.
+     */
     @Throws(IncorrectOperationException::class)
     override fun bindToElement(newElement: PsiElement): PsiElement {
-        val targetPsiFile = newElement.containingFile
-            ?: throw IncorrectOperationException("Target has no containing file")
-        val targetVf = targetPsiFile.virtualFile
-            ?: throw IncorrectOperationException("Target VirtualFile missing")
-
         val sourcePsiFile = element.containingFile
             ?: throw IncorrectOperationException("Source has no containing file")
-        val sourceVf = sourcePsiFile.virtualFile
-            ?: throw IncorrectOperationException("Source VirtualFile missing")
-
         val project = sourcePsiFile.project
         val resolver = PathResolver(project)
-
         val fullSourcePath = segments.joinToString("/")
 
-        // Получаем все sources root из настроек IDE
+        // Получаем все source roots
         val sourceRoots = ReadAction.compute<List<VirtualFile>, RuntimeException> { resolver.getRoots() }
 
-        // Ищем sources root, в котором находится target
-        val rootContainingTarget = sourceRoots.firstOrNull { VfsUtilCore.isAncestor(it, targetVf, true) }
+        // Попытка получить VirtualFile из newElement (если newElement — файл/элемент в файле)
+        val effectiveTargetVf: VirtualFile? = ReadAction.compute<VirtualFile?, RuntimeException> {
+            when {
+                newElement is PsiFileSystemItem -> newElement.virtualFile
+                newElement.containingFile != null -> newElement.containingFile.virtualFile
+                else -> null
+            }
+        }
 
-        // Строим путь с приоритетом sources root, иначе fallback на корень проекта
-        val targetRelative: String = if (rootContainingTarget != null) {
-            VfsUtilCore.getRelativePath(targetVf, rootContainingTarget, '/')?.removeSuffix(".hbs")
-        } else {
-            VfsUtilCore.getRelativePath(targetVf, project.baseDir, '/')?.removeSuffix(".hbs")
-        } ?: targetVf.nameWithoutExtension
+        // Если VF доступен — формируем относительный путь; иначе пробуем взять имя из newElement
+        val replacementFromVf: String? = if (effectiveTargetVf != null) {
+            val rootContainingTarget = sourceRoots.firstOrNull { VfsUtilCore.isAncestor(it, effectiveTargetVf, true) }
+            if (rootContainingTarget != null) {
+                VfsUtilCore.getRelativePath(effectiveTargetVf, rootContainingTarget, '/')?.removeSuffix(".hbs")
+            } else {
+                VfsUtilCore.getRelativePath(effectiveTargetVf, project.baseDir, '/')?.removeSuffix(".hbs")
+            } ?: effectiveTargetVf.nameWithoutExtension
+        } else null
 
-        val replacement = targetRelative
+        val replacementFromName: String? = ReadAction.compute<String?, RuntimeException> {
+            when {
+                newElement is PsiNamedElement -> newElement.name
+                newElement is PsiNameIdentifierOwner -> newElement.name
+                else -> null
+            }
+        }
 
-        // Заменяем весь исходный путь
+        val replacement = replacementFromVf ?: replacementFromName
+            ?: throw IncorrectOperationException("Cannot determine replacement text from newElement")
+
+        // Вычисление диапазона замены внутри документа (абсолютные оффсеты)
         val fullPathText: String = ReadAction.compute<String, RuntimeException> { element.text }
         val (replaceStartOffset, replaceEndOffset) = run {
             val foundIndex = fullPathText.indexOf(fullSourcePath)
@@ -107,18 +122,95 @@ class SegmentReference(
             }
         }
 
+        // Коммитим все документы перед операцией
+        PsiDocumentManager.getInstance(project).commitAllDocuments()
+
+        var resultingPsi: PsiElement? = null
         WriteCommandAction.runWriteCommandAction(project) {
             val doc: Document = PsiDocumentManager.getInstance(project).getDocument(sourcePsiFile)
                 ?: throw IncorrectOperationException("Document is null")
+
             if (replaceStartOffset < 0 || replaceEndOffset > doc.textLength || replaceStartOffset > replaceEndOffset) {
                 throw IncorrectOperationException("Invalid range to replace: $replaceStartOffset..$replaceEndOffset")
             }
+
             doc.replaceString(replaceStartOffset, replaceEndOffset, replacement)
+            PsiDocumentManager.getInstance(project).commitDocument(doc)
+
+            resultingPsi = sourcePsiFile.findElementAt(replaceStartOffset)
+        }
+
+        return resultingPsi ?: newElement
+    }
+
+    /**
+     * Когда рефакторинг переименования целевого элемента выполняется (Shift+F6),
+     * платформа вызывает handleElementRename на ссылках. Здесь мы должны
+     * изменить только соответствующий сегмент (segments[idx]) в тексте ссылки.
+     *
+     * Примечание: не делаем никаких VFS/PSI-rename'ов — этим занимается платформа.
+     */
+    override fun handleElementRename(newElementName: String): PsiElement {
+        val sourcePsiFile = element.containingFile
+            ?: throw IncorrectOperationException("Source has no containing file")
+        val project = sourcePsiFile.project
+
+        // Снимем .hbs если пользователь ввёл его в newElementName — ссылки должны быть без расширения
+        val cleanedNewName = if (newElementName.endsWith(".hbs")) {
+            newElementName.removeSuffix(".hbs")
+        } else newElementName
+
+        // Текст элемента (внутри PSI) — работаем в ReadAction
+        val elementText: String = ReadAction.compute<String, RuntimeException> { element.text }
+        val fullSourcePath = segments.joinToString("/")
+
+        // Ищем fullSourcePath внутри elementText и заменяем только нужный сегмент.
+        // Если не найден — используем rangeInElement как fallback и ищем сегмент внутри него.
+        val (segAbsStart, segAbsEnd) = run {
+            val foundIndex = elementText.indexOf(fullSourcePath)
+            if (foundIndex >= 0) {
+                // prefix (включая слэш) перед сегментом
+                val prefix = if (idx == 0) "" else segments.subList(0, idx).joinToString("/") + "/"
+                val segStartInElement = foundIndex + prefix.length
+                val segEndInElement = segStartInElement + segments[idx].length
+                val absStart = element.textRange.startOffset + segStartInElement
+                val absEnd = element.textRange.startOffset + segEndInElement
+                Pair(absStart, absEnd)
+            } else {
+                // fallback: ищем внутри rangeInElement
+                val r = rangeInElement
+                val inner = elementText.substring(r.startOffset, r.endOffset)
+                val foundInner = inner.indexOf(segments[idx])
+                if (foundInner >= 0) {
+                    val segStartInElement = r.startOffset + foundInner
+                    val segEndInElement = segStartInElement + segments[idx].length
+                    val absStart = element.textRange.startOffset + segStartInElement
+                    val absEnd = element.textRange.startOffset + segEndInElement
+                    Pair(absStart, absEnd)
+                } else {
+                    // если не нашли — заменим весь rangeInElement целиком
+                    val absStart = element.textRange.startOffset + r.startOffset
+                    val absEnd = element.textRange.startOffset + r.endOffset
+                    Pair(absStart, absEnd)
+                }
+            }
+        }
+
+        // Выполняем замену в документе
+        PsiDocumentManager.getInstance(project).commitAllDocuments()
+        WriteCommandAction.runWriteCommandAction(project) {
+            val doc = PsiDocumentManager.getInstance(project).getDocument(sourcePsiFile)
+                ?: throw IncorrectOperationException("Document is null")
+
+            if (segAbsStart < 0 || segAbsEnd > doc.textLength || segAbsStart > segAbsEnd) {
+                throw IncorrectOperationException("Invalid segment range to replace: $segAbsStart..$segAbsEnd")
+            }
+
+            doc.replaceString(segAbsStart, segAbsEnd, cleanedNewName)
             PsiDocumentManager.getInstance(project).commitDocument(doc)
         }
 
-        val updatedOffset = element.textRange.startOffset + rangeInElement.startOffset
-        val updated = sourcePsiFile.findElementAt(updatedOffset)
-        return updated ?: newElement
+        // Попробуем вернуть обновлённый элемент на позиции начала вставки
+        return sourcePsiFile.findElementAt(segAbsStart) ?: element
     }
 }
